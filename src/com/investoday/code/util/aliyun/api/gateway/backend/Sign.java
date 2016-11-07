@@ -1,0 +1,250 @@
+package com.investoday.code.util.aliyun.api.gateway.backend;
+
+import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang.StringUtils;
+import org.apache.log4j.Logger;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+
+/**
+ * 后端服务签名示例
+ */
+public class Sign {
+	private static Logger logger = Logger.getLogger(Sign.class);
+    //API网关中所有参与签名计算的HTTP请求头的Key,以应为逗号分割
+    public static final String CA_PROXY_SIGN_HEADERS = "X-Ca-Proxy-Signature-Headers";
+    //API网关计算的签名
+    public static final String CA_PROXY_SIGN = "X-Ca-Proxy-Signature";
+    //API网关用于计算签名的密钥Key
+    public static final String CA_PROXY_SIGN_SECRET_KEY = "X-Ca-Proxy-Signature-Secret-Key";
+    //签名算法HmacSha256
+    public static final String HMAC_SHA256 = "HmacSHA256";
+    //换行符
+    public static char LF = '\n';
+    //编码
+    private static final String ENCODING = "UTF-8";
+    //HTTP POST
+    private static final String HTTP_METHOD_POST = "post";
+    //HTTP PUT
+    private static final String HTTP_METHOD_PUT = "put";
+    //HTTP HEADER是否转换成小写（部分WEB容器中接受到的所有HEADER的KEY都是小写）
+    private static final boolean HTTP_HEADER_TO_LOWER_CASE = false;
+
+    //签名密钥Map,用于存储多对服务端签名计算密钥,一旦正在使用的密钥泄露,只需要将密钥列表中的其他密钥配置到网关即可进行密钥热替换
+    private static Map<String, String> signSecretMap = new HashMap<String, String>();
+
+    static {
+        //TODO：修改为自己的密钥组合
+        signSecretMap.put("SZInvestoday", "SZInvestoday");
+    }
+
+    /**
+     * 计算HTTP请求签名
+     *
+     * @param uri              原始HTTP请求PATH（不包含Query）
+     * @param httpMethod       原始HTTP请求方法
+     * @param headers          原始HTTP请求所有请求头
+     * @param paramsMap        原始HTTP请求所有Query+Form参数
+     * @param inputStreamBytes 原始HTTP请求Body体（仅当请求为POST/PUT且非表单请求才需要设置此属性,表单形式的需要将参数放到paramsMap中）
+     * @return 签名结果
+     * @throws Exception
+     */
+    public static String serviceSign(String uri, String httpMethod, Map<String, String> headers, Map<String, Object> paramsMap, byte[] inputStreamBytes) throws Exception {
+        Map<String, String> headersToSign = buildHeadersToSign(headers);
+        String bodyMd5 = buildBodyMd5(httpMethod, inputStreamBytes);
+        String resourceToSign = buildResource(uri, paramsMap);
+        String stringToSign = buildStringToSign(headersToSign, resourceToSign, httpMethod, bodyMd5);
+
+        Mac hmacSha256 = Mac.getInstance(HMAC_SHA256);
+        String secret = signSecretMap.get(headers.get(HTTP_HEADER_TO_LOWER_CASE ? CA_PROXY_SIGN_SECRET_KEY.toLowerCase() : CA_PROXY_SIGN_SECRET_KEY));
+        
+        byte[] keyBytes = secret.getBytes(ENCODING);
+        hmacSha256.init(new SecretKeySpec(keyBytes, 0, keyBytes.length, HMAC_SHA256));
+
+        return new String(Base64.encodeBase64(hmacSha256.doFinal(stringToSign.getBytes(ENCODING))), ENCODING);
+    }
+
+    /**
+     * 构建BodyMd5
+     *
+     * @param httpMethod       HTTP请求方法
+     * @param inputStreamBytes HTTP请求Body体字节数组
+     * @return Body Md5值
+     * @throws IOException
+     */
+    private static String buildBodyMd5(String httpMethod, byte[] inputStreamBytes) throws IOException {
+        if (inputStreamBytes == null) {
+            return null;
+        }
+
+        if (!httpMethod.equalsIgnoreCase(HTTP_METHOD_POST) && !httpMethod.equalsIgnoreCase(HTTP_METHOD_PUT)) {
+            return null;
+        }
+
+        InputStream inputStream = new ByteArrayInputStream(inputStreamBytes);
+        byte[] bodyBytes = IOUtils.toByteArray(inputStream);
+        if (bodyBytes != null && bodyBytes.length > 0) {
+            return base64AndMD5(bodyBytes);
+        }
+        return null;
+    }
+
+    /**
+     * 将Map转换为用&及=拼接的字符串
+     */
+    private static String buildMapToSign(Map<String, Object> paramMap) {
+        StringBuilder builder = new StringBuilder();
+
+        for (Map.Entry<String, Object> e : paramMap.entrySet()) {
+            if (builder.length() > 0) {
+                builder.append('&');
+            }
+
+            String key = e.getKey();
+            Object value = e.getValue();
+
+            if (value != null) {
+                if (value instanceof List) {
+                    List list = (List) value;
+                    if (list.size() == 0) {
+                        builder.append(key);
+                    } else {
+                        builder.append(key).append("=").append(String.valueOf(list.get(0)));
+                    }
+                } else if (value instanceof Object[]) {
+                    Object[] objs = (Object[]) value;
+                    if (objs.length == 0) {
+                        builder.append(key);
+                    } else {
+                        builder.append(key).append("=").append(String.valueOf(objs[0]));
+                    }
+                } else {
+                    builder.append(key).append("=").append(String.valueOf(value));
+                }
+            }
+        }
+
+        return builder.toString();
+    }
+
+    /**
+     * 构建参与签名的HTTP头
+     *
+     * @param headers HTTP请求头
+     * @return 所有参与签名计算的HTTP请求头
+     */
+    private static Map<String, String> buildHeadersToSign(Map<String, String> headers) {
+        Map<String, String> headersToSignMap = new TreeMap<String, String>();
+
+        String headersToSignString = headers.get(HTTP_HEADER_TO_LOWER_CASE ? CA_PROXY_SIGN_HEADERS.toLowerCase() : CA_PROXY_SIGN_HEADERS);
+
+        if (headersToSignString != null) {
+            for (String headerKey : headersToSignString.split("\\,")) {
+                headerKey = HTTP_HEADER_TO_LOWER_CASE ? headerKey.toLowerCase() : headerKey;
+                headersToSignMap.put(headerKey, headers.get(headerKey));
+            }
+        }
+
+        return headersToSignMap;
+    }
+
+    /**
+     * 组织待计算签名字符串
+     *
+     * @param headers        HTTP请求头
+     * @param resourceToSign Uri+请求参数的签名字符串
+     * @param method         HTTP方法
+     * @param bodyMd5        Body Md5值
+     * @return 待计算签名字符串
+     */
+    private static String buildStringToSign(Map<String, String> headers, String resourceToSign, String method, String bodyMd5) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(method).append(LF);
+        if (StringUtils.isNotBlank(bodyMd5)) {
+            sb.append(bodyMd5);
+        }
+        sb.append(LF);
+        sb.append(buildHeaders(headers));
+        sb.append(resourceToSign);
+
+        return sb.toString();
+    }
+
+    /**
+     * 组织Headers签名签名字符串
+     *
+     * @param headers HTTP请求头
+     * @return Headers签名签名字符串
+     */
+    private static String buildHeaders(Map<String, String> headers) {
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, String> e : headers.entrySet()) {
+            if (e.getValue() != null) {
+                sb.append(e.getKey().toLowerCase()).append(':').append(e.getValue()).append(LF);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 组织Uri+请求参数的签名字符串
+     *
+     * @param uri       HTTP请求uri,不包含Query
+     * @param paramsMap HTTP请求所有参数（Query+Form参数）
+     * @return Uri+请求参数的签名字符串
+     */
+    private static String buildResource(String uri, Map<String, Object> paramsMap) {
+        StringBuilder builder = new StringBuilder();
+
+        // uri
+        builder.append(uri);
+
+        // Query+Form
+        TreeMap<String, Object> sortMap = new TreeMap<String, Object>();
+        sortMap.putAll(paramsMap);
+
+
+        // 有Query+Form参数
+        if (sortMap.size() > 0) {
+            builder.append('?');
+            builder.append(buildMapToSign(sortMap));
+        }
+
+        return builder.toString();
+    }
+
+    /**
+     * 先进行MD5摘要再进行Base64编码获取摘要字符串
+     *
+     * @param bytes 待计算字节数组
+     * @return
+     */
+    public static String base64AndMD5(byte[] bytes) {
+        if (bytes == null) {
+            throw new IllegalArgumentException("bytes can not be null");
+        }
+
+        try {
+            final MessageDigest md = MessageDigest.getInstance("MD5");
+            md.reset();
+            md.update(bytes);
+            final Base64 base64 = new Base64();
+
+            return new String(base64.encode(md.digest()));
+        } catch (final NoSuchAlgorithmException e) {
+            throw new IllegalArgumentException("unknown algorithm MD5");
+        }
+    }
+}
